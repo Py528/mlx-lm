@@ -1,4 +1,49 @@
-## MLX LM 
+## MLX LM — Patched: KV Cache Preallocation for Stable Long-Context Serving
+
+> **This is a fork of [ml-explore/mlx-lm](https://github.com/ml-explore/mlx-lm) with one focused addition:**
+> `--kv-preallocate-size` — preallocate the full KV cache buffer upfront to prevent macOS kernel panics
+> during long-context inference on memory-constrained Apple Silicon (tested: 27B model at 64k context on 24GB).
+
+### The problem
+
+Running `mlx_lm.server` with large models at long contexts on 24GB unified memory causes **macOS kernel panics**
+(`completeMemory() prepare count underflow` in `IOGPUMemory.cpp`). The root cause is `KVCache` and
+`QuantizedKVCache` growing their buffers in `step=256` chunks via `mx.concatenate` — each reallocation
+triggers a new wired-memory allocation until the GPU driver runs out of mappable wired memory and panics the kernel.
+The system doesn't crash gracefully — it hard reboots.
+
+### The fix
+
+Add `--kv-preallocate-size N` to `mlx_lm.server`: allocates the full `N`-token KV buffer in a **single
+`mx.zeros` call** at cache creation time, then writes tokens in-place. Zero reallocations. Zero wired-memory
+spikes. No kernel panics.
+
+```bash
+mlx_lm.server \
+  --model mlx-community/Qwen3.8-27B-4bit \
+  --port 8080 \
+  --kv-bits 4 \
+  --kv-group-size 64 \
+  --kv-preallocate-size 65536 \
+  --prefill-step-size 256
+```
+
+### Benchmarks (27B 4-bit, 64k context, 24GB M-series Mac)
+
+| Mode | Prefill | Decode | Stability |
+|---|---|---|---|
+| Default (step=256 realloc) | baseline | baseline | kernel panic at ~40-50k tokens |
+| `--kv-preallocate-size 65536 --kv-bits 4` | **2.4–3× faster** | **30–60% faster** | stable across 10-turn stress test at 65,536 tokens |
+
+Prefill speedup comes from eliminating reallocation stalls mid-prefill. Decode speedup comes from
+contiguous buffer layout — no fragmented concatenation history.
+
+See [`QUANTIZED_KV_PREALLOCATION_GUIDE.md`](QUANTIZED_KV_PREALLOCATION_GUIDE.md) for full
+architecture, debugging journey, and reproduction script.
+
+---
+
+## MLX LM
 
 MLX LM is a Python package for generating text and fine-tuning large language
 models on Apple silicon with MLX.
